@@ -1,6 +1,7 @@
 import argparse
 import os
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 import requests
@@ -15,6 +16,10 @@ load_dotenv()
 api_key = os.getenv("TWITTERAPI_KEY")
 if not api_key:
     raise ValueError(".env ファイルに TWITTERAPI_KEY が設定されていません。")
+
+webhook_url = os.getenv("DISCORD_WEBHOOK_URL")
+if not webhook_url:
+    raise ValueError(".env ファイルに DISCORD_WEBHOOK_URL が設定されていません。")
 
 # 1. 引数から対象ユーザーを指定する
 parser = argparse.ArgumentParser(description="指定したユーザーの直近1日分のポスト（ツイート）を取得します。")
@@ -44,6 +49,7 @@ params = {"query": query}
 
 response = requests.get(url, headers=headers, params=params)
 
+
 def parse_created_at(created_at_str: str) -> str:
     """createdAt文字列（例: 'Mon Sep 21 00:08:32 +0000 2026'）をJST日時に変換"""
     if not created_at_str:
@@ -55,11 +61,39 @@ def parse_created_at(created_at_str: str) -> str:
     except Exception:
         return created_at_str
 
+
+def post_discord(webhook_url: str, text: str):
+    """テキストをDiscordのWebHookに送信（2000文字制限対策として分割送信）"""
+    chunks = []
+    current_chunk = ""
+    for line in text.splitlines(keepends=True):
+        if len(current_chunk) + len(line) > 1900:
+            if current_chunk:
+                chunks.append(current_chunk.strip())
+                current_chunk = ""
+            while len(line) > 1900:
+                chunks.append(line[:1900])
+                line = line[1900:]
+        current_chunk += line
+    if current_chunk.strip():
+        chunks.append(current_chunk.strip())
+
+    for i, chunk in enumerate(chunks):
+        res = requests.post(webhook_url, json={"content": chunk})
+        if res.status_code not in (200, 204):
+            print(f"Discordへの送信エラー ({res.status_code}): {res.text}")
+        if i < len(chunks) - 1:
+            time.sleep(0.5)
+
+
 if response.status_code == 200:
     data = response.json()
     tweets = data.get("tweets", [])
-    print(f"対象ユーザー: @{target_user}")
-    print(f"取得したポスト件数: {len(tweets)}\n")
+
+    report_lines = [
+        f"**対象ユーザー: @{target_user}**",
+        f"取得したポスト件数: {len(tweets)}\n",
+    ]
 
     for i, tweet in enumerate(tweets, 1):
         msg = tweet.get("text") or tweet.get("full_text") or ""
@@ -67,9 +101,16 @@ if response.status_code == 200:
         formatted_time = parse_created_at(created_at_str)
         time_header = f" [{formatted_time}]" if formatted_time else ""
 
-        print(f"--- メッセージ {i}{time_header} ---")
-        print(msg)
-        print()
+        report_lines.append(f"--- メッセージ {i}{time_header} ---")
+        report_lines.append(msg)
+        report_lines.append("")
+
+    report_text = "\n".join(report_lines)
+
+    print(report_text)
+    post_discord(webhook_url, report_text)
+    print("Discordへポストしました。")
 else:
-    print(f"エラーが発生しました: {response.status_code}")
-    print(response.text)
+    error_msg = f"エラーが発生しました: {response.status_code}\n{response.text}"
+    print(error_msg)
+    post_discord(webhook_url, error_msg)
